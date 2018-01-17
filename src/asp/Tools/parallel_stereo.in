@@ -1,0 +1,623 @@
+#!/usr/bin/env python
+# __BEGIN_LICENSE__
+#  Copyright (c) 2009-2013, United States Government as represented by the
+#  Administrator of the National Aeronautics and Space Administration. All
+#  rights reserved.
+#
+#  The NGT platform is licensed under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance with the
+#  License. You may obtain a copy of the License at
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+# __END_LICENSE__
+
+
+import sys, optparse, subprocess, re, os, math, time, tempfile, glob,\
+       shutil, math
+import os.path as P
+
+if sys.version_info < (2, 6, 0):
+    print('\nERROR: Must use Python 2.6 or greater.')
+    sys.exit(1)
+
+libexec_path = sys.path[0] + '/../libexec'
+sys.path.insert(0, libexec_path) # prepend to Python path
+from stereo_utils import * # must be after the path is altered above
+
+# Prepend to system PATH
+os.environ["PATH"] = libexec_path + os.pathsep + os.environ["PATH"]
+
+job_pool  = [] # currently running jobs
+
+# The ids of individual stereo steps
+s_pprc = 0; s_corr = 1; s_rfne = 2; s_fltr = 3; s_tri = 4; s_mosaic = 5
+
+def produce_tiles( settings, tile_w, tile_h ):
+    image_size = settings["trans_left_image_size"]
+    tiles_nx = int(math.ceil( float(image_size[0]) / tile_w ))
+    tiles_ny = int(math.ceil( float(image_size[1]) / tile_h ))
+
+    tiles = []
+    for j in range( tiles_ny ):
+        for i in range( tiles_nx ):
+            c_tile_w = tile_w
+            c_tile_h = tile_h
+            if i == tiles_nx - 1:
+                c_tile_w = int(image_size[0]) - i * tile_w
+            if j == tiles_ny - 1:
+                c_tile_h = int(image_size[1]) - j * tile_h
+            tiles.append(BBox(i*tile_w,j*tile_h,c_tile_w,c_tile_h))
+
+    return tiles
+
+def add_job( cmd ):
+    sleep_time = 0.001
+    while ( len(job_pool) >= opt.processes ):
+        for i in range(len(job_pool)):
+            if ( job_pool[i].poll() is not None ):
+                job_pool.pop(i)
+                job_pool.append( subprocess.Popen(cmd) )
+                return
+        time.sleep( sleep_time )
+        sleep_time = (sleep_time * 5) % 60
+    job_pool.append( subprocess.Popen(cmd) )
+
+def wait_on_all_jobs():
+    print "Waiting for jobs to finish"
+    sleep_time = 1
+    while len(job_pool) > 0:
+        for i in range(len(job_pool)):
+            if ( job_pool[i].poll() is not None ):
+                job_pool.pop(i)
+                break # must restart as array changed size
+        time.sleep( sleep_time )
+
+def wipe_option(options, opt, n):
+    # In the array 'options', find the entry with value 'opt'.
+    # Wipe this entry and the next n values.
+    while opt in options:
+        r = options.index(opt)
+        if r < len(options): del options[r] # rm 'opt'
+        for i in range(n):
+            if r < len(options): del options[r]
+
+def create_subproject_dirs( settings, **kw ):
+
+    # Create a subdirectory for each process we start.  Pretend
+    # previous steps of stereo already ran in that directory by
+    # creating symbolic links to actual files in parent run directory.
+    # Don't symlink to RD.tif or PC.tif as those will be files which
+    # actually need to be created in each subdirectory.
+    
+    for tile in produce_tiles( settings, opt.job_size_w, opt.job_size_h ):
+        out_prefix = settings['out_prefix'][0]
+        subproject_dir = out_prefix + tile.name_str()
+        tile_prefix = subproject_dir + "/" + tile.name_str() 
+        if opt.dryrun:
+            print "mkdir -p %s" % subproject_dir
+            print "soft linking via %s %s" % (tile_prefix, out_prefix)
+        else:
+            try:
+                os.mkdir( subproject_dir )
+            except OSError, e:
+                pass
+
+            files = glob.glob(out_prefix + '*')
+            for f in files:
+                if os.path.isdir(f): continue
+                sym_f = f.replace(out_prefix, tile_prefix)
+                relative_f = os.path.relpath(f, subproject_dir)
+                if not os.path.lexists(sym_f):
+                    m1 = re.match('^.*?-(PC|RD).tif$', relative_f)
+                    m2 = re.match('^.*?-log.*?.txt$', relative_f) # skip logs
+                    if not m1 and not m2:
+                        os.symlink(relative_f, sym_f)
+
+def rename_files( settings, postfix_in, postfix_out, **kw ):
+
+    # Rename tile_dir/file_in.tif to tile_dir/file2.tif
+    tiles = produce_tiles( settings, opt.job_size_w, opt.job_size_h )
+    for tile in tiles:
+        directory = settings['out_prefix'][0] + tile.name_str()
+        filename_in  = directory + "/" + tile.name_str() + postfix_in
+        filename_out = directory + "/" + tile.name_str() + postfix_out
+        if os.path.isfile(filename_in) and not os.path.islink(filename_in):
+            os.rename(filename_in, filename_out)
+                
+def build_vrt( settings, postfix, tile_postfix, **kw ):
+
+    image_size = settings["trans_left_image_size"]
+    f = open(settings['out_prefix'][0]+postfix,'w')
+    f.write("<VRTDataset rasterXSize=\"%i\" rasterYSize=\"%i\">\n" % (int(image_size[0]),int(image_size[1])) )
+
+    tiles = produce_tiles( settings, opt.job_size_w, opt.job_size_h )
+
+    # If a tile is missing, for example, in the case we
+    # skipped it when it does not intersect user's crop box,
+    # substitute it with a different one, to ensure the mosaic
+    # does not have holes.
+    goodFilename = ""
+    for tile in tiles:
+        directory = settings['out_prefix'][0] + tile.name_str()
+        filename  = directory + "/" + tile.name_str() + tile_postfix
+        if os.path.isfile(filename):
+            goodFilename = filename
+            break
+    if goodFilename == "":
+        raise Exception('No tiles were generated')
+
+    # Do gdalinfo on the file to get metadata
+    args=[goodFilename]
+    sep = "="
+    gdal_settings=run_and_parse_output( "gdalinfo", args, sep, opt.verbose )
+
+    # Extract the data type (e.g., Float32 or Float64)
+    data_type = "Float32"
+    for s in gdal_settings:
+        val = " ".join(gdal_settings[s])
+        m = re.match('^.*? Type (\w+)', val)
+        if m:
+            data_type = m.group(1)
+            break
+
+    # Find how many bands are in the file
+    num_bands = 0    
+    for s in gdal_settings:
+        m = re.match('^.*?Band\s+(\d+)', s)
+        if m:
+            b = int(m.group(1))
+            if num_bands < b:
+                num_bands = b
+
+    # Extract the shift in a point clound file, if present
+    POINT_OFFSET = "POINT_OFFSET" # Tag name must be synced with C++ code
+    if POINT_OFFSET in gdal_settings:
+        f.write("  <Metadata>\n    <MDI key=\"" + POINT_OFFSET + "\">" +
+                gdal_settings[POINT_OFFSET][0] + "</MDI>\n  </Metadata>\n")
+
+    # Write each band
+    for b in range( 1, num_bands + 1 ):
+        f.write("  <VRTRasterBand dataType=\"%s\" band=\"%i\">\n" %
+                (data_type,b) )
+
+        for tile in tiles:
+            directory = settings['out_prefix'][0] + tile.name_str()
+            filename  = directory + "/" + tile.name_str() + tile_postfix
+
+            if not os.path.isfile(filename): filename = goodFilename
+
+            relative  = os.path.relpath(filename, os.path.dirname( settings['out_prefix'][0] ) )
+            f.write("    <SimpleSource>\n")
+            f.write("       <SourceFilename relativeToVRT=\"1\">%s</SourceFilename>\n" % relative)
+            f.write("       <SourceBand>%i</SourceBand>\n" % b)
+            f.write("       <SrcRect xOff=\"%i\" yOff=\"%i\" xSize=\"%i\" ySize=\"%i\"/>\n" %
+                    (tile.x, tile.y, tile.width, tile.height) )
+            f.write("       <DstRect xOff=\"%i\" yOff=\"%i\" xSize=\"%i\" ySize=\"%i\"/>\n" %
+                    (tile.x, tile.y, tile.width, tile.height) )
+            f.write("    </SimpleSource>\n")
+        f.write("  </VRTRasterBand>\n")
+    f.write("</VRTDataset>\n")
+    f.close()
+
+def get_num_nodes(nodes_list):
+
+    if nodes_list is None:
+        return 1 # local machine
+
+    # Count the number of nodes without repetition
+    # (need this for Pleiades).
+    nodes = {}
+    num_nodes = 0
+    try:
+        fh = open(nodes_list, "r")
+        for line in fh:
+            if re.match('^\s*$', line): continue # skip empty lines
+            matches = re.match('^\s*([^\s]*)', line)
+            if matches:
+                nodes[matches.group(1)] = 1
+
+        num_nodes = len(nodes)
+    except Exception, e:
+        die(e)
+    if num_nodes == 0:
+        raise Exception('The list of computing nodes is empty')
+
+    return num_nodes
+
+def get_best_procs_threads(step, settings):
+    # Decide the best number of processes to use on a node, and how
+    # many threads to use for each process.
+
+    # We assume all machines have the same number of CPUs (cores)
+    num_cpus = get_num_cpus()
+
+    if step == s_corr:
+        tile_size = int(settings['corr_tile_size'][0])
+    elif step == s_rfne:
+        tile_size = int(settings['rfne_tile_size'][0])
+    elif step == s_tri:
+        tile_size = int(settings['tri_tile_size'][0])
+    else:
+        raise Exception('Stereo step %d must be executed on a single machine.' \
+                        % step)
+    
+    # We use the observation that each tile uses one thread,
+    # so we need to find how many tiles are in the given job.
+    num_threads = int(opt.job_size_w*opt.job_size_h/tile_size/tile_size)
+    if num_threads > num_cpus: num_threads = num_cpus
+    if num_threads <= 0: num_threads = 1
+
+    # For triangulation, we need to consider the case of ISIS cameras
+    # when we must use 1 thread no matter what.
+    if step == s_tri:
+        cam_info = " ".join(settings['in_file1'] + settings['in_file2'] + \
+                            settings['cam_file1'] + settings['cam_file2'])
+        m = re.search('\\.cub\\b', cam_info, re.IGNORECASE)
+        if m:
+            num_threads = 1
+
+    num_procs = int(math.ceil(float(num_cpus)/num_threads))
+
+    if opt.verbose:
+        print("For stage %d, using %d threads and %d processes." %
+              (step, num_threads, num_procs))
+
+    return (num_procs, num_threads)
+
+# Launch GNU Parallel for all tiles, it will take care of distributing
+# the jobs across the nodes and load balancing. The way we accomplish
+# this is by calling this same script but with --tile-id <num>.
+def sprawn_to_nodes(step, settings, args):
+
+    if opt.processes is None or opt.threads_multi is None:
+        # The user did not specify these. We will find the best
+        # for their system.
+        (procs, threads) = get_best_procs_threads(step, settings)
+    else:
+        procs = opt.processes
+        threads = opt.threads_multi
+        
+    wipe_option(args, '--processes', 1)
+    wipe_option(args, '--threads-multiprocess', 1)
+    args.extend(['--processes', str(procs)])
+    args.extend(['--threads-multiprocess', str(threads)])
+
+    tiles = produce_tiles( settings, opt.job_size_w, opt.job_size_h )
+
+    # Each tile has an id, which is its index in the list of tiles.
+    # There can be a huge amount of tiles, and for that reason we
+    # store their ids in a file, rather than putting them on the
+    # command line.
+    tmpFile = tempfile.NamedTemporaryFile(delete=True, dir='.')
+    f = open(tmpFile.name, 'w')
+    for i in range(len(tiles)):
+        f.write("%d\n" % i)
+    f.close()
+
+    # Use GNU parallel with given number of processes.
+    cmd = ['parallel', '-u', '-P', str(procs), '-a', tmpFile.name]
+    if which(cmd[0]) is None:
+        raise Exception('Need GNU Parallel to distribute the jobs.')
+
+    if opt.nodes_list is not None:
+        cmd += ['--sshloginfile', opt.nodes_list]
+
+    # The options which we want GNU parallel to not mess up with.
+    # Put them into a single string.
+    python_path = sys.executable # children must use same Python as parent
+    start = step; stop = start + 1
+    args_str = python_path + " " + \
+               " ".join(args) + " --entry-point " + str(start) + \
+               " --stop-point " + str(stop) + " --work-dir "  + opt.work_dir
+    if opt.isisroot  is not None: args_str += " --isisroot "  + opt.isisroot
+    if opt.isis3data is not None: args_str += " --isis3data " + opt.isis3data
+    args_str += " --tile-id {}"
+    cmd += [args_str]
+
+    if opt.verbose:
+        print(" ".join(cmd))
+
+    code = subprocess.call(cmd)
+    if code != 0:
+        raise Exception('parallel_stereo call for step ' + str(start) + ' failed')
+
+# Launch jobs on the current machine
+def parallel_run(bin, args, settings, tiles, **kw):
+    binpath = P.join(kw.get('path', P.dirname(P.abspath(__file__))), '..', 'bin', bin)
+    call = [binpath]
+    call.extend(args)
+
+    if opt.threads_multi is not None:
+        wipe_option(call, '--threads', 1)
+        call.extend(['--threads', str(opt.threads_multi)])
+
+    # Will do only the tiles intersecting user's crop window.
+    w = settings['transformed_window']
+    user_crop_win = BBox(int(w[0]), int(w[1]), int(w[2]), int(w[3]))
+    try:
+        for tile in tiles:
+
+            crop_box = intersect_boxes(user_crop_win, tile)
+            if crop_box.width <= 0 or crop_box.height <= 0: continue
+            crop_str = crop_box.crop_str()
+
+            cmd = call+crop_str
+            cmd[cmd.index( settings['out_prefix'][0] )]                  \
+                           = settings['out_prefix'][0] + tile.name_str() \
+                           + "/" + tile.name_str()
+            if opt.dryrun:
+                print " ".join(cmd)
+                return
+
+            if opt.verbose:
+                print " ".join(cmd)
+            add_job( cmd )
+        wait_on_all_jobs()
+    except OSError, e:
+        raise Exception('%s: %s' % (binpath, e))
+
+def single_run(bin, args, **kw):
+
+    binpath = P.join(kw.get('path', P.dirname(P.abspath(__file__))), \
+                     '..', 'bin', bin)
+    call = [binpath]
+    call.extend(args)
+
+    if opt.threads_single is not None:
+        wipe_option(call, '--threads', 1)
+        call.extend(['--threads', str(opt.threads_single)])
+
+    if opt.dryrun:
+        print '%s' % ' '.join(call)
+        return
+    try:
+        if opt.verbose:
+            print '%s' % ' '.join(call)
+        code = subprocess.call(call)
+    except OSError, e:
+        raise Exception('%s: %s' % (binpath, e))
+    if code != 0:
+        raise Exception('Stereo step ' + kw['msg'] + ' failed')
+
+if __name__ == '__main__':
+    usage = '''parallel_stereo [options] <Left_input_image> <Right_input_image>
+              [Left_camera_file] [Right_camera_file] <output_file_prefix> [DEM]
+        Extensions are automaticaly added to the output files.
+        Camera model arguments may be optional for some stereo
+        session types (e.g. isis). Stereo parameters should be
+        set in the stereo.default file.
+
+  [ASP [@]ASP_VERSION[@]]'''
+
+    # What makes this program different from stereo.in is that it
+    # tries to treat ASP as a multi-process system instead of a
+    # multi-threaded executable. This has benefits on the super
+    # computer by allowing a single stereo pair use multiple
+    # computers. It also allows us to get past the single-threaded
+    # constraints of ISIS.
+
+    # Algorithm: When the script is started, it starts one copy of
+    # itself on each node if doing steps 1, 2, or 4 (corr, rfne, tri).
+    # Those scripts in turn start actual jobs on those nodes.
+    # For the other steps, the script does the work itself.
+
+    p = PassThroughOptionParser(usage=usage)
+    p.add_option('--nodes-list',           dest='nodes_list', default=None,
+                 help='The list of computing nodes, one per line. ' + \
+                 'If not provided, run on the local machine.')
+    p.add_option('--processes',            dest='processes', default=None,
+                 type='int', help='The number of processes to use per node.')
+    p.add_option('--threads-multiprocess', dest='threads_multi', default=None,
+                 type='int', help='The number of threads to use per process.')
+    p.add_option('--threads-singleprocess',dest='threads_single', default=None,
+                 type='int', 
+                 help='The number of threads to use when running a single process (PPRC and FLTR).')
+    p.add_option('--corr-seed-mode',       dest='seed_mode', default=None,
+                 help='Correlation seed strategy. See stereo_pprc for options.',
+                 type='int')
+    p.add_option('-e', '--entry-point',    dest='entry_point', default=0,
+                 help='Stereo Pipeline entry point (an integer from 0-5).',
+                 type='int')
+    p.add_option('--stop-point',           dest='stop_point',  default=6,
+                 help='Stereo Pipeline stop point (an integer from 1-6).',
+                 type='int')
+    p.add_option('--job-size-w',           dest='job_size_w',  default=2048,
+                 help='Pixel width of input image tile for a single process.',
+                 type='int')
+    p.add_option('--job-size-h',           dest='job_size_h',  default=2048,
+                 help='Pixel height of input image tile for a single process.',
+                 type='int')
+    p.add_option('--sparse-disp-options', dest='sparse_disp_options',
+                 help='Options to pass directly to sparse_disp.')
+    p.add_option('-v', '--version',        dest='version', default=False,
+                 action='store_true', help='Display the version of software.')
+    p.add_option('-s', '--stereo-file',    dest='filename',    default='./stereo.default',
+                 help='Explicitly specify the stereo.default file to use. [default: ./stereo.default]')
+
+    # Internal variables below.
+    # The id of the tile to process, 0 <= tile_id < num_tiles.
+    p.add_option('--tile-id', dest='tile_id', default=None, type='int',
+                 help=optparse.SUPPRESS_HELP)
+    # Directory where the job is running
+    p.add_option('--work-dir', dest='work_dir', default=None,
+                 help=optparse.SUPPRESS_HELP)
+    # ISIS settings
+    p.add_option('--isisroot', dest='isisroot', default=None,
+                 help=optparse.SUPPRESS_HELP)
+    p.add_option('--isis3data', dest='isis3data', default=None,
+                 help=optparse.SUPPRESS_HELP)
+    # Debug options
+    p.add_option('--dry-run', dest='dryrun', default=False, action='store_true',
+                 help=optparse.SUPPRESS_HELP)
+    p.add_option('--verbose', dest='verbose', default=False, action='store_true',
+                 help=optparse.SUPPRESS_HELP)
+
+    global opt
+    (opt, args) = p.parse_args()
+
+    if not args and not opt.version:
+        p.print_help()
+        die('\nERROR: Missing input files', code=2)
+
+    if opt.threads_single is None:
+        opt.threads_single = get_num_cpus()
+
+    # If corr-seed-mode was not specified, read it from the file
+    if opt.seed_mode is None:
+        opt.seed_mode = parse_corr_seed_mode(opt.filename)
+    # If not set in the file either, use 1.
+    if opt.seed_mode is None:
+        opt.seed_mode = 1
+    # Pass it to the subprocesses
+    args.extend(['--corr-seed-mode', str(opt.seed_mode)])
+
+    args.extend(['--stereo-file', opt.filename])
+    
+    if opt.tile_id is None:
+        # When the script is started, set some options from the
+        # environment which we will pass to the scripts we sprawn
+        # 1. Set the work directory
+        opt.work_dir = os.getcwd()
+        # 2. Set the ISIS settings if any
+        if 'ISISROOT'  in os.environ: opt.isisroot  = os.environ['ISISROOT']
+        if 'ISIS3DATA' in os.environ: opt.isis3data = os.environ['ISIS3DATA']
+        # 3. Fix for Pleiades, copy the nodes_list to current directory
+        if opt.nodes_list is not None:
+            if not os.path.isfile(opt.nodes_list):
+                die('\nERROR: No such nodes-list file: ' + opt.nodes_list, code=2)
+            tmpFile = tempfile.NamedTemporaryFile(delete=True, dir='.')
+            shutil.copy2(opt.nodes_list, tmpFile.name)
+            opt.nodes_list = tmpFile.name
+            wipe_option(sys.argv, '--nodes-list', 1)
+            sys.argv.extend(['--nodes-list', tmpFile.name])
+    else:
+        # After the script spawns itself to nodes, it starts in the
+        # home dir. Make it go to the right place.
+        os.chdir(opt.work_dir)
+        # Set the ISIS settings
+        if opt.isisroot  is not None: os.environ['ISISROOT']  = opt.isisroot
+        if opt.isis3data is not None: os.environ['ISIS3DATA'] = opt.isis3data
+
+    num_nodes = get_num_nodes(opt.nodes_list)
+
+    if opt.version:
+        args.append('-v')
+
+    args=unescape_vals(args)
+
+    args_sub = args[:] # deep copy
+    args_sub.extend(['--compute-low-res-disparity-only'])
+
+    sep = ","
+    settings=run_and_parse_output( "stereo_parse", args, sep, opt.verbose )
+
+    if opt.tile_id is None:
+
+        # We get here when the script is started. The current running
+        # process has become the management process that spawns other
+        # copies of itself on other machines. This block will only do
+        # actual work when we hit a non-multiprocess step like PPRC or
+        # FLTR.
+
+        # Wipe options which we will override.
+        self_args = sys.argv # shallow copy
+        wipe_option(self_args, '-e', 1)
+        wipe_option(self_args, '--entry-point', 1)
+        wipe_option(self_args, '--stop-point', 1)
+
+        # Preprocessing
+        step = s_pprc
+        if ( opt.entry_point <= step ):
+            single_run('stereo_pprc', args, msg='%d: Preprocessing' % step)
+            create_subproject_dirs( settings ) # symlink L.tif, etc
+            # Now the left is defined. Regather the settings
+            # and properly create the project dirs.
+            settings=run_and_parse_output( "stereo_parse", args, sep,
+                                           opt.verbose )
+
+        # Correlation. First do low-res.
+        step = s_corr
+        if ( opt.entry_point <= step ):
+            if ( opt.stop_point <= step ): sys.exit()
+            if ( opt.seed_mode == 3 ):
+                run_sparse_disp(args, opt)
+            else:
+                single_run('stereo_corr',
+                           args_sub, msg='%d: Low-res correlation' % step)
+            create_subproject_dirs( settings ) # symlink D_sub
+            sprawn_to_nodes(step, settings, self_args)
+            # Bugfix: When doing refinement for a given tile, we must see
+            # the result of correlation for all tiles. To achieve that,
+            # rename all correlation tiles to something else,
+            # build the vrt of all correlation tiles, and sym link
+            # that vrt from all tile directories.
+            rename_files( settings, "-D.tif", "-Dnosym.tif" )
+            build_vrt( settings, "-D.tif", "-Dnosym.tif" )
+            create_subproject_dirs( settings ) # symlink D.tif
+
+        # Refinement
+        step = s_rfne
+        if ( opt.entry_point <= step ):
+            if ( opt.stop_point <= step ): sys.exit()
+            create_subproject_dirs( settings )
+            sprawn_to_nodes(step, settings, self_args)
+
+        # Filtering
+        step = s_fltr
+        if ( opt.entry_point <= step ):
+            if ( opt.stop_point <= step ): sys.exit()
+            build_vrt( settings, "-RD.tif", "-RD.tif" )
+            single_run('stereo_fltr', args, msg='%d: Filtering' % step)
+            create_subproject_dirs( settings ) # symlink F.tif
+
+        # Triangulation. First compute the point cloud center.
+        step = s_tri
+        if ( opt.entry_point <= step ):
+            if ( opt.stop_point <= step ): sys.exit()
+            l_args = args[:] # deep copy
+            l_args.append('--compute-point-cloud-center-only')
+            single_run('stereo_tri',  l_args, msg='%d: Triangulation' % step)
+            create_subproject_dirs( settings ) # symlink cloud center
+            sprawn_to_nodes(step, settings, self_args)
+
+        # Point cloud mosaic.
+        step = s_mosaic
+        if ( opt.entry_point <= step ):
+            if ( opt.stop_point <= step ): sys.exit()
+            create_subproject_dirs( settings )
+            build_vrt( settings, "-PC.tif", "-PC.tif" )
+
+    else:
+
+        # This process was sprawned by GNU Parallel with a given
+        # value of opt.tile_id. Launch the job for that tile.
+        if opt.verbose:
+            print("Running on machine: ", os.uname())
+
+        try:
+
+            # The list of tiles
+            tiles = produce_tiles( settings, opt.job_size_w, opt.job_size_h )
+            num_tiles = len(tiles)
+            min_index = opt.tile_id
+            max_index = opt.tile_id + 1
+            tiles = tiles[min_index:max_index]
+
+            if ( opt.entry_point == s_corr ):
+                parallel_run('stereo_corr', args, settings, tiles,
+                             msg='%d: Correlation' % opt.entry_point)
+            if ( opt.entry_point == s_rfne ):
+                parallel_run('stereo_rfne', args, settings, tiles,
+                             msg='%d: Refinement' % opt.entry_point)
+            if ( opt.entry_point == s_tri ):
+                parallel_run('stereo_tri', args, settings, tiles,
+                             msg='%d: Triangulation' % opt.entry_point)
+
+        except Exception, e:
+            die(e)
+            raise

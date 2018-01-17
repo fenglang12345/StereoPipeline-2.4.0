@@ -1,0 +1,409 @@
+\chapter{The {\tt stereo.default} File}
+\label{ch:stereodefault}
+
+The \texttt{stereo.default} file contains configuration parameters
+that the \texttt{stereo} program uses to process images.  The
+\texttt{stereo.default} file is loaded from the current working
+directory when you run \texttt{stereo} unless you specify a different
+file using the \texttt{-s} option. Run \texttt{stereo -\/-help} for
+more information. The extension is not important for this file.
+
+A sample \texttt{stereo.default.example} file is included in the
+\texttt{examples/} directory of the Stereo Pipeline software
+distribution.
+
+% -------------------------------------------------------------------
+%                           PREPROCESSING
+% -------------------------------------------------------------------
+
+\section{Preprocessing}
+\label{stereo-default-preprocessing}
+\hrule
+\bigskip
+
+\begin{description}
+
+\item[alignment-method \textnormal{\small{(= affineepipolar, homography,
+      epipolar, none)}} (default = affineepipolar)] \hfill \\
+
+  When \texttt{alignment-method} is set to \texttt{homography},
+  \texttt{stereo} will attempt to pre-align the images by
+  automatically detecting tie-points between images using a feature
+  based image matching technique. Tiepoints are stored in a
+  \texttt{*.match} file that is used to compute a linear homography
+  transformation of the right image so that it closely matches the
+  left image.  Note: the user may exercise more control over this
+  process by using the \texttt{ipfind} and \texttt{ipmatch} tools.
+
+  When \texttt{alignment-method} is set to \texttt{affineepipolar},
+  \texttt{stereo} will attempt to pre-align the images by detecting
+  tie-points, as earlier, and using those to transform the images such
+  that pairs of conjugate epipolar lines become collinear and parallel to
+  one of the image axes.  The effect of this is equivalent to rotating the
+  original cameras which took the pictures.
+
+  When \texttt{alignment-method} is set to \texttt{epipolar},
+  \texttt{stereo} will apply a 3D transform to both images so that
+  their epipolar lines will be horizontal. This speeds of stereo
+  correlation as it greatly reduces the area required for searching.
+
+  {\em Epipolar alignment is only available when performing stereo
+    matches using the pinhole stereo session (i.e. when using}
+  \texttt{stereo -t pinhole}){\em, and cannot be used when processing
+    ISIS images at this time.}
+
+\item[force-use-entire-range \textnormal (default = false)] \hfill \\
+  By default, the Stereo Pipeline will normalize ISIS images so that
+  their maximum and minimum channel values are $\pm$2 standard
+  deviations from a mean value of 1.0.  Use this option if you want to
+  {\em disable} normalization and force the raw
+  values to pass directly to the stereo correlations algorithms.
+
+  For example, if ISIS's \texttt{histeq} has already been used to
+  normalize the images, then use this option to disable normalization
+  as a (redundant) pre-processing step.
+
+
+\item[individually-normalize \textnormal (default = false)] \hfill \\
+  By default, the maximum and minimum valid pixel value is determined
+  by looking at both images.  Normalized with the same ``global'' min
+  and max guarantees that the two images will retain their brightness
+  and contrast relative to each other.
+
+  This option forces each image to be normalized to its own maximum
+  and minimum valid pixel value. This is useful in the event that
+  images have different and non-overlapping dynamic ranges. You can
+  sometimes tell when this option is needed: after a failed stereo
+  attempt one of the rectified images (\texttt{*-L.tif} and
+  \texttt{*-R.tif}) may be either mostly white or black.  Activating
+  this option may correct this problem.
+
+  Note: Photometric calibration and image normalization are steps that
+  can and should be carried out beforehand using ISIS's own utilities.
+  This provides the best possible input to the stereo pipeline and
+  yields the best stereo matching results.
+
+\item[nodata-value \textnormal (default = none)] \hfill \\
+  Pixels with values less than or equal to this number are treated as
+  no-data. This overrides the nodata values from input images.
+
+\end{description}
+
+\section{Correlation}
+\label{corr_section}
+\hrule
+\bigskip
+
+\begin{description}
+
+\item[prefilter-mode \textnormal{\small{(= 0,1,2,3)}} (default = 2)] \hfill \\
+  This selects the pre-processing filter to be used to prepare imagery
+  before it is fed to the initialization stage of the pipeline.
+
+  \begin{description}
+    \item[0 - None]
+    \item[1 - Subtracted Mean] - This takes a preferably large
+      Gaussian kernel and subtracts its value from the input
+      image. This effectively reduces low frequency content in the
+      image. The result is correlation that is immune to translations
+      in image intensity.
+    \item[2 - LoG Filter] - Takes the Laplacian of Gaussian of the
+      image, This provides some immunity to differences in lighting
+      conditions between a pair of images by isolating and matching on
+      blob features in the image.
+    \item[3 - Sign of LoG] - Not recommended for using. It was meant
+      for an experimental XOR cost metric for correlation. This will
+      still produce results. Though the results may not be as nice as
+      one would like.
+  \end{description}
+
+  For all of the modes above, the size of the filter kernel is
+  determined by the \texttt{prefilter-kernel-width} parameter below.
+
+  The choice of pre-processing filter must be made with thought to the
+  cost function being used (see \texttt{cost-mode}, below).  LoG filter
+  preprocessing provides good immunity to variations in lighting
+  conditions and is usually the recommended choice.
+
+\item[prefilter-kernel-width \textnormal{\small{(= \emph{float})}} (default = 1.4)] \hfill \\
+  This defines the diameter of the Gaussian convolution kernel used
+  for the preprocessing modes 1 and 2 above. A value of 1.4 works
+  well for LoG and 25-30 works well for Subtracted Mean.
+
+\item[corr-seed-mode \textnormal{\small{(=0,1,2,3)}}] (default = 1) \hfill \\
+  This integer parameter selects a strategy for how to solve for the
+  low-resolution integer correlation disparity, which is used to seed
+  the full-resolution disparity later on.
+
+  \begin{description}
+  \item[0 - None] - Don't calculate a low-resolution variant of the
+    disparity image. The search range provided by \texttt{corr-search}
+    is used directly in computing the full-resolution disparity.
+
+  \item[1 - Low-resolution disparity from stereo] - Calculate a
+    low-resolution version of the disparity from the integer correlation
+    of subsampled left and right images.  The low-resolution disparity
+    will be used to narrow down the search range for the full-resolution
+    disparity.
+
+    This is a useful option despite the fact that our integer
+    correlation implementation does indeed use a pyramid approach. Our
+    implementation cannot search infinitely into lower resolutions due
+    to its independent and tiled nature. This low-resolution disparity
+    seed is a good hybrid approach.
+
+  \item[2 - Low-resolution disparity from an input DEM] - Use a
+    lower-resolution DEM together with an estimated value for its error
+    to compute the low-resolution disparity, which will then be used to
+    find the full-resolution disparity as above. These quantities can be
+    specified via the options \texttt{disparity-estimation-dem} and
+    \texttt{disparity-estimation-dem-error} respectively.
+
+  \item[3 - Disparity from full-resolution images at a sparse number of
+    points.] This is an advanced option for terrain having snow and no
+    large-scale features. It is described in section \ref{sparse-disp}.
+
+  \end{description}
+
+  For large images, bigger than MOC-NA, using the low-resolution
+  disparity seed is a definitive plus. Smaller images such as Cassini
+  ISS or MER images should just shut this option off to save storage
+  space.
+
+\item[corr-sub-seed-percent \textnormal{\small{(= \emph{float})}} (default=0.25)] \hfill \\
+  When using \texttt{corr-seed-mode 1}, the solved-for or user-provided
+  search range is grown by this factor for the purpose of computing the
+  low-resolution disparity.
+
+\item[cost-mode \textnormal{\small{(= 0,1,2)}}] (default = 2) \hfill \\
+
+  This defines the cost function used during integer
+  correlation. Squared difference is the fastest cost
+  function. However it comes at the price of not being resilient
+  against noise. Absolute difference is the next fastest and is a
+  better choice. Normalized cross correlation is the slowest but is
+  designed to be more robust against image intensity changes and
+  slight lighting differences. Normalized cross correlation is about
+  2x slower than absolute difference and about 3x slower than squared
+  difference.
+
+  \begin{description}
+    \item[0 - absolute difference]
+    \item[1 - squared difference]
+    \item[2 - normalized cross correlation]
+  \end{description}
+
+\item[corr-kernel \textnormal{\small{(= \emph{integer integer})}} (default = 25 25)] \hfill \\
+  These option determine the size (in pixels) of the correlation
+  kernel used in the initialization step.  A different size can be set
+  in the horizontal and vertical directions, but square correlation
+  kernels are almost always used in practice.
+
+\item[corr-search \textnormal{\small{(= \emph{integer integer integer integer})}}] \hfill \\
+  These parameters determine the size of the initial correlation
+  search range.  The ideal search range depends on a variety of
+  factors ranging from how the images were pre-aligned to the
+  resolution and range of disparities seen in a given image pair.
+  This search range is successively refined during initialization, so
+  it is often acceptable to set a large search range that is guaranteed
+  to contain all of the disparities in a given image.  However,
+  setting tighter bounds on the search can sometimes reduce the number
+  of erroneous matches, so it can be advantageous to tune the
+  search range for a particular data set.
+
+  Commenting out these settings will cause \texttt{stereo} to make an
+  attempt to guess its search range using interest points.
+
+  The order of the four integers define the minimum horizontal and
+  vertical disparity and then the maximum horizontal and vertical
+  disparity.
+
+\item[xcorr-threshold \textnormal{\small{(= \emph{integer})}} (default = 2)] \hfill \\
+
+  Integer correlation to a limited sense performs a correlation
+  forward and backwards to double check its result. This is one of the
+  first filtering steps to insure that we have indeed converged to a
+  global minimum for an individual pixel. The \texttt{xcorr-threshold}
+  parameter defines an agreement threshold in pixels between the
+  forward and backward result.
+
+  Optionally, this parameter can be set to a negative number. This
+  will signal the correlator to only use the forward correlation
+  result. This will drastically improve speed at the cost of
+  additional noise.
+
+\item[use-local-homography \textnormal (default = false)] \hfill \\
+
+  This flag, if provided, enables using local homography during
+  correlation, as described in Section \ref{sec:local_hom}.
+
+\item[corr-timeout \textnormal{\small{(= \emph{integer})}} (default = 0)]\hfill \\
+
+  Correlation timeout for an image tile, in seconds. A non-positive
+value will result in no timeout enforcement.
+
+\end{description}
+
+\section{Subpixel Refinement}
+\hrule
+\bigskip
+
+\begin{description}
+
+\item[subpixel-mode \textnormal{\small{(= 0,1,2,3)}} (default = 1)] \hfill \\
+  This parameter selects the subpixel correlation method. Parabola subpixel 
+  is very fast but will produce results that are only slightly more accurate
+   than those produced by the initialization step. Bayes EM (mode 2) 
+  is very slow but offers the best quality. When tuning {\tt stereo.default} 
+  parameters, it is expedient to start out using parabola subpixel as a 
+  ``draft mode.'' When the results are looking good with parabola subpixel, 
+  then they  will look even better with subpixel mode 2.  For inputs with 
+  little noise, the affine method (subpixel mode 3) may produce results
+  equivalent to Bayes EM in a shorter time.
+
+  \begin{description}
+    \item[0 - no subpixel refinement]
+    \item[1 - parabola fitting ]
+    \item[2 - affine adaptive window, Bayes EM weighting ]
+    \item[3 - affine window ]
+    \item[4 - Lucas-Kanade method (experimental)]
+    \item[5 - affine adaptive window, Bayes EM with Gamma Noise Distribution (experimental) ]
+  \end{description}
+
+  For a visual comparison of the quality of these subpixel modes,
+  refer back to Chapter:\ref{ch:correlation}.
+
+\item[subpixel-kernel \textnormal{\small{(= \emph{integer integer})}} (default = 35 35)]
+  Specify the size of the horizontal and vertical size (in pixels) of
+  the subpixel correlation kernel. It is advantageous to keep this
+  small for parabola fitting in order to resolve finer
+  details. However for the Bayes EM methods, keep the kernel slightly
+  larger. Those methods weight the kernel with a Gaussian
+  distribution, thus the effective area is small than the kernel size
+  defined here.
+
+\end{description}
+
+% -------------------------------------------------------------------
+%                           FILTERING
+% -------------------------------------------------------------------
+
+\section{Filtering}
+\label{filter_options}
+
+\hrule
+\bigskip
+
+\begin{description}
+
+\item[filter-mode \textnormal{\small{(= \emph{integer})}} (default = 1)]
+\hfill \\ This parameter sets the filter mode. Three modes are supported
+as described below. Here, by neighboring pixels for a current pixel we
+mean those pixels within the window of half-size of
+\texttt{rm-half-kernel} centered at the current pixel.
+  \begin{description}
+    \item[0] - No filtering.
+    \item[1] - Filter by discarding pixels at which disparity differs from mean disparity of neighbors by more than \texttt{max-mean-diff}. 
+    \item[2] - Filter by discarding pixels at which percentage of neighboring disparities that are within \texttt{rm-threshold} of current disparity is less than \texttt{rm-min-matches}. 
+  \end{description}
+ 
+\item[rm-half-kernel \textnormal{\small{(= \emph{integer integer})}} (default = 5 5)] \hfill \\
+  This setting adjusts the behavior of an outlier rejection scheme
+  that ``erodes'' isolated regions of pixels in the disparity map that
+  are in disagreement with their neighbors.
+
+  The two parameters determine the size of the half kernel that is
+  used to perform the automatic removal of low confidence pixels.  A
+  $5 \times 5$ half kernel would result in an $11 \times 11$ kernel
+  with 121 pixels in it.
+
+\item[max-mean-diff \textnormal{\small{(= \emph{integer})}} (default = 3)] \hfill \\
+  This parameter sets the {\em maximum difference} between the current pixel disparity and the mean of disparities of neighbors in order for a
+  given disparity value to be retained (for \texttt{filter-mode} 1).
+
+\item[rm-min-matches \textnormal{\small{(= \emph{integer})}} (default = 60)] \hfill \\
+  This parameter sets the {\em percentage} of neighboring disparity
+  values that must fall within the inlier threshold in order for a
+  given disparity value to be retained (for \texttt{filter-mode} 2).
+
+\item[rm-threshold \textnormal{\small{(= \emph{integer})}} (default = 3)] \hfill \\
+  This parameter sets the inlier threshold for the outlier rejection
+  scheme.  This option works in conjunction with RM\_MIN\_MATCHES
+  above.  A disparity value is rejected if it differs by more than
+  RM\_THRESHOLD disparity values from RM\_MIN\_MATCHES percent of
+  pixels in the region being considered  (for \texttt{filter-mode} 2).
+
+\item[rm-clean-passes \textnormal{\small{(= \emph{integer})}} (default = 1)] \hfill \\
+  Select the number of outlier removal passes that are carried out.
+  Each pass will erode pixels that do not match their neighbors.  One
+  pass is usually sufficient.
+
+\item[enable-fill-holes (default = false)] \hfill \\
+
+Enable filling of holes in disparity using an inpainting
+method. Obsolete. It is suggested to use instead point2dem's analogous
+functionality.
+
+\item[fill-holes-max-size \textnormal{\small{(= \emph{integer})}} (default = 100,000)] \hfill \\
+  Holes with no more pixels than this number should be filled in.
+
+\item[erode-max-size \textnormal{\small{(= \emph{integer})}} (default = 0)] \hfill \\
+  Isolated blobs with no more pixels than this number should be removed.
+
+\end{description}
+
+% -------------------------------------------------------------------
+%                           POST_PROCESSING
+% -------------------------------------------------------------------
+
+\section{Post-Processing (Triangulation)}
+\label{triangulation_options}
+\hrule
+\bigskip
+
+\begin{description}
+\item[near-universe-radius \textnormal{\small{(= \emph{float})}} (default = 0.0)]
+\item[far-universe-radius \textnormal{\small{(= \emph{float})}} (default = 0.0)] \hfill \\
+
+These parameters can be used to filter out triangulated points in
+the 3D point cloud. The points that will be kept are those
+whose distance from the universe center (see below) is between
+\texttt{near-universe-radius} and \texttt{far-universe-radius}, in meters.
+
+\item[universe-center \textnormal (default = none)] \hfill \\
+Defines the reference location to use when filtering the output point cloud
+using the above near and far radius options. The available options
+are:
+
+  \begin{description}
+    \item[None] - Disable filtering.
+    \item[Camera] - Use the left camera's center as the universe center.
+    \item[Zero]   - Use the center of the planet as the universe center.
+  \end{description}
+
+\item[point-cloud-rounding-error \textnormal{\small{(= \emph{double})}}
+  (default = $1/2^{10} = 0.0009765625$)] \hfill \\
+
+How much to round the output point cloud values, in meters (more rounding means
+less precision but potentially smaller size on disk). The inverse of a
+power of 2 is suggested.
+
+\item[save-double-precision-point-cloud \textnormal (default = false)] \hfill \\
+
+Save the final point cloud in double precision rather than bringing the
+points closer to origin and saving as float (marginally more precision
+at twice the storage).
+
+\item[compute-error-vector \textnormal (default = false)] \hfill \\
+
+When writing the output point cloud, save the 3D triangulation error
+vector (the vector between the closest points on the rays emanating from
+the two cameras), rather than just its length. In this case, the point
+cloud will have 6 bands (storing the triangulation point and
+triangulation error vector) rather than the usual 4. When invoking
+\texttt{point2dem} on this 6-band point cloud and specifying the
+\texttt{-\/-errorimage} option, the error image will contain the three
+components of the triangulation error vector in the North-East-Down
+coordinate system.
+
+\end{description}

@@ -1,0 +1,96 @@
+HOW TO MAKE A RELEASE
+
+Here's a developer's checklist for performing a binary Ames Stereo
+Pipeline (ASP) release.
+
+1.) Modify the build system:
+
+Inside ASP's configure.ac, remove "_post" and increment version number
+on the AC_INIT line. Do not do this for VisionWorkbench, as that
+library has its own versioning.
+
+2.) Update the ISIS version to the latest:
+ - In BinaryBuilder/Packages.py (chksum variable), to force 
+   ISIS to recompile as part of the nightly build.
+ - In StereoPipeline/README
+
+3.) Update NEWS
+
+4.) Commit and tag release in repo. Example: 
+
+  git tag v2.4.0 
+
+Push the tags to the remote server with: 
+
+ git push origin v2.4.0 # commit to your branch
+ git push god    v2.4.0 # commit to main branch
+
+If more commits were made and it is desired to apply this tag to a
+different commit, first remove the exiting tag with:
+
+  git tag -d v2.4.0
+  git push origin :refs/tags/v2.4.0
+  git push god    :refs/tags/v2.4.0
+
+5.) Build and package the software and documentation:
+
+  - Modify BinaryBuilder to deal with any changes in dependencies.
+  - Build the dependenices, see BinaryBuilder/README, section 3.B, 
+    part 1.
+  - Build the documentation in StereoPipeline/docs/book. Must do
+    make distclean at the top level first, to force that the ASP
+    version gets updated.
+  - Greatly reduce the size of the pdf with:
+    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook \
+       -dNOPAUSE -dQUIET -dBATCH -sOutputFile=output.pdf asp_book.pdf
+    (this only works with newer version of gs, such as on zula).
+  - Copy the obtained pdf file to BinaryBuilder/dist-add/asp_book.pdf.
+  - Build the ASP release tarball, see BinaryBuilder/README,
+    section 3.B, part 2.
+
+6.) Test all binary releases on different machines by running
+    StereoPipelineTest.
+
+NOTE: Steps 5 to 6 are done automatically by running on lunokhod1
+the script
+
+  $HOME/projects/BinaryBuilder/auto_build/launch_master.sh
+
+The resulting release tarballs will go to BinaryBuilder/asp_tarballs.
+
+7.) Check that the ASP version is correct in the documentation
+file. Read the entire documentation.
+
+8.) Test on both Linux and Mac if point2mesh works and if the 
+    'osgviewer' included with the release can load it. 
+
+9.) Rename the builds to follow the release convention. This 
+requires removing the timestamp from tarball name, which can be
+done with the script BinaryBuilder/auto_build/rm_timestamp.sh.
+
+10.) Copy the new builds and documentation to the release area at
+/byss/docroot/stereopipeline/binaries and update the website, at
+https://ti.arc.nasa.gov/cms/ (SG can give permissions to edit the
+pages under /tech/asr/intelligent-robotics/ngt). Update:
+ - The sidebar 
+ - The main page, inluding:
+   * Binary release links
+   * ISIS version
+   * Source code release link
+   * Documentation link
+
+11.) Ask fellow ASP developers to do some tests and review the
+documentation.
+
+12.) Send an announcement of the new release to the mailing list, at
+stereo-pipeline@lists.nasa.gov, listing the changes specified in NEWS.
+
+13.) Modify the build system:
+
+Inside ASP's configure.ac, append "_post" to version number in AC_INIT
+line.
+
+14.) Reflect any changes in release policy by modifying this document.
+
+15.) Commit changes.
+
